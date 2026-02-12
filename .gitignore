@@ -1,0 +1,5 @@
+/src/test.py
+/jina-embeddings-v4-local
+*__pycache__*
+/src/download_vdr_dataset.py
+nohup.out
