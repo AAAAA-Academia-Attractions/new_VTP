@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-languages", default="all")
     # infra
     p.add_argument("--device", default="auto")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--save-dir", default="/root/autodl-tmp/new_VTP/checkpoints/vision_probing")
     p.add_argument("--run-name", default=None)
     # wandb
@@ -121,6 +121,9 @@ def layer_index_from_col(col: str) -> int:
     return int(col.split("_")[-1])
 
 
+# ---------------------------------------------------------------------------
+# Torch Dataset wrapper (returns pre-gathered tensors per sample)
+# ---------------------------------------------------------------------------
 class VDRTrainDataset(TorchDataset):
     """
     Wraps the HF Arrow dataset.  Each __getitem__ returns:
@@ -162,56 +165,83 @@ class VDRTrainDataset(TorchDataset):
         neg_global_indices = [self.id_to_index[nid] for nid in neg_ids if nid in self.id_to_index]
         K = len(neg_global_indices)
 
-        neg_layers = {}
-        if K > 0:
-            #neg_rows = self.full_ds.select(neg_global_indices)
-            neg_rows = self.full_ds[neg_global_indices]
-            for col in self.image_layer_cols:
-                neg_layers[col] = torch.tensor(neg_rows[col], dtype=torch.float32)  # (K, D)
+
+        # neg_layers = {}
+        # if K > 0:
+        #     neg_rows = self.full_ds[neg_global_indices]
+        #     for col in self.image_layer_cols:
+        #         neg_layers[col] = torch.tensor(neg_rows[col], dtype=torch.float32)  # (K, D)
+        # else:
+        #     D = pos_layers[self.image_layer_cols[0]].shape[-1]
+        #     for col in self.image_layer_cols:
+        #         neg_layers[col] = torch.zeros(0, D, dtype=torch.float32)
+
+        return text_anchor, pos_layers, neg_global_indices, K
+
+
+class FastCollate:
+    def __init__(self, full_ds, image_layer_cols):
+        self.full_ds = full_ds
+        self.image_layer_cols = image_layer_cols
+
+    def __call__(self, batch):
+        text_anchors = torch.stack([b[0] for b in batch])
+        
+        # Positives
+        first_pos = batch[0][1]
+        pos_images = {k: torch.stack([b[1][k] for b in batch]) for k in first_pos}
+
+        # Negatives Logic
+        neg_indices_per_row = [b[2] for b in batch]
+        K_max = max(len(x) for x in neg_indices_per_row)
+        if K_max == 0: K_max = 1
+
+        # Flatten indices to fetch
+        flat_indices = []
+        for row_indices in neg_indices_per_row:
+            flat_indices.extend(row_indices)
+
+        # BULK FETCH
+        if flat_indices:
+            # full_ds[list] is highly optimized in HF Datasets
+            neg_data_flat = self.full_ds[flat_indices] 
         else:
-            D = pos_layers[self.image_layer_cols[0]].shape[-1]
-            for col in self.image_layer_cols:
-                neg_layers[col] = torch.zeros(0, D, dtype=torch.float32)
+            neg_data_flat = {col: [] for col in self.image_layer_cols}
 
-        return text_anchor, pos_layers, neg_layers, K
+        # Reconstruct tensors
+        neg_images = {}
+        B = len(batch)
+        
+        # Create output tensors (B, K_max, D) initialized to 0
+        # We fill them row by row. 
+        # Note: Ideally we would vectorize the fill, but Python loop here is acceptable 
+        # because we already saved the I/O overhead.
+        
+        for col in self.image_layer_cols:
+            # Convert the huge flat list to one big tensor first (CPU)
+            # This is faster than creating tiny tensors
+            if flat_indices:
+                flat_tensor = torch.tensor(neg_data_flat[col], dtype=torch.float32)
+            else:
+                flat_tensor = torch.empty(0, pos_images[col].shape[-1])
+            
+            out_tensor = torch.zeros(B, K_max, flat_tensor.shape[-1], dtype=torch.float32)
+            
+            cursor = 0
+            for i, indices in enumerate(neg_indices_per_row):
+                k = len(indices)
+                if k > 0:
+                    out_tensor[i, :k] = flat_tensor[cursor : cursor+k]
+                    cursor += k
+            
+            neg_images[col] = out_tensor
 
+        # Mask
+        neg_mask = torch.zeros(B, K_max, dtype=torch.bool)
+        for i, indices in enumerate(neg_indices_per_row):
+            neg_mask[i, :len(indices)] = True
 
-
-def collate_fn(batch):
-    """
-    Custom collate that pads negative counts to the max K in the batch.
-    Returns:
-      text_anchors: (B, D)
-      pos_images:   dict[col -> (B, D)]
-      neg_images:   dict[col -> (B, K_max, D)]
-      neg_mask:     (B, K_max) bool – True where the negative is real
-    """
-    text_anchors = torch.stack([b[0] for b in batch])
-    B = len(batch)
-
-    col_names = list(batch[0][1].keys())
-    D = batch[0][1][col_names[0]].shape[-1]
-    K_max = max(b[3] for b in batch)
-    if K_max == 0:
-        K_max = 1  # avoid zero-size tensors
-
-    pos_images = {}
-    neg_images = {}
-    for col in col_names:
-        pos_images[col] = torch.stack([b[1][col] for b in batch])  # (B, D)
-        neg_tensor = torch.zeros(B, K_max, D, dtype=torch.float32)
-        for i, b in enumerate(batch):
-            k = b[3]
-            if k > 0:
-                neg_tensor[i, :k] = b[2][col]
-        neg_images[col] = neg_tensor
-
-    neg_mask = torch.zeros(B, K_max, dtype=torch.bool)
-    for i, b in enumerate(batch):
-        k = b[3]
-        neg_mask[i, :k] = True
-
-    return text_anchors, pos_images, neg_images, neg_mask
+        return text_anchors, pos_images, neg_images, neg_mask
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +435,7 @@ def main() -> None:
         image_layer_cols=image_layer_cols,
         full_ds=ds_full,
     )
+    collate_fn = FastCollate(full_ds=ds_full, image_layer_cols=image_layer_cols)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -455,11 +486,10 @@ def main() -> None:
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=True)
         for text_anchors, pos_images, neg_images, neg_mask in pbar:
-            print("here")
             text_anchors = text_anchors.to(device)     # (B, D) already normalised
             neg_mask = neg_mask.to(device)              # (B, K)
 
-            total_loss = torch.tensor(0.0, device=device)
+            total_loss = torch.zeros(1, device=device)
             log_dict: Dict[str, float] = {}
 
             for col in image_layer_cols:
@@ -494,9 +524,9 @@ def main() -> None:
 
                 layer_idx = layer_index_from_col(col)
                 log_dict[f"train/loss_layer_{layer_idx:02d}"] = loss_layer.item()
-                #log_dict[f"train/l1_reg_layer_{layer_idx:02d}"] = l1_reg.item()
+                log_dict[f"train/l1_reg_layer_{layer_idx:02d}"] = l1_reg.item()
                 log_dict[f"train/acc_layer_{layer_idx:02d}"] = acc_layer
-                #log_dict[f"train/logit_scale_layer_{layer_idx:02d}"] = logit_scale.exp().item()
+                log_dict[f"train/logit_scale_layer_{layer_idx:02d}"] = logit_scale.exp().item()
 
             optimizer.zero_grad()
             total_loss.backward()
