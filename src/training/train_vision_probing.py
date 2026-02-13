@@ -309,6 +309,10 @@ def evaluate_probes_on_test(
 
     for lang in languages:
         ds = load_from_disk(f"{test_dataset_dir}/{lang}")
+
+        # --- NEW: Force PyTorch formatting on the evaluation dataset ---
+        ds.set_format(type="torch", columns=[TEXT_ANCHOR_COL] + image_layer_cols)
+
         all_ids = ds["id"]
         id_to_idx = {sid: i for i, sid in enumerate(all_ids)}
 
@@ -332,8 +336,11 @@ def evaluate_probes_on_test(
 
         for col in image_layer_cols:
             probe = probes[col]
-            # Build probed corpus from ALL rows
-            all_image_raw = torch.tensor(ds[col], dtype=torch.float32, device=device)
+            
+            # --- UPDATE: ds[col] is now already a tensor ---
+            # Just move it to the device and ensure it's float32
+            all_image_raw = ds[col].to(device, dtype=torch.float32)
+            
             corpus = probe(all_image_raw)  # already normalised by the probe
             n_corpus = corpus.shape[0]
 
