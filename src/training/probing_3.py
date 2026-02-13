@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-languages", default="all")
     # infra
     p.add_argument("--device", default="auto")
-    p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument("--num-workers", type=int, default=1)
     p.add_argument("--save-dir", default="/root/autodl-tmp/new_VTP/checkpoints/vision_probing")
     p.add_argument("--run-name", default=None)
     # wandb
@@ -125,22 +125,7 @@ def layer_index_from_col(col: str) -> int:
 # Torch Dataset wrapper (returns pre-gathered tensors per sample)
 # ---------------------------------------------------------------------------
 class VDRTrainDataset(TorchDataset):
-    """
-    Wraps the HF Arrow dataset.  Each __getitem__ returns:
-      - text_anchor : (D,) float32   – normalised text_layer_36
-      - image_layers: dict[col_name -> (D,)] float32  – raw image per layer
-      - neg_image_layers: dict[col_name -> (K, D)] float32 – raw neg images per layer
-    """
-
-    def __init__(
-        self,
-        ds: Dataset,
-        id_to_index: Dict[str, int],
-        image_layer_cols: List[str],
-        full_ds: Dataset,
-    ):
-        # ds is the filtered (non-empty query) subset
-        # full_ds is the complete dataset (for negative lookups)
+    def __init__(self, ds, id_to_index, image_layer_cols, full_ds):
         self.ds = ds
         self.id_to_index = id_to_index
         self.image_layer_cols = image_layer_cols
@@ -152,29 +137,19 @@ class VDRTrainDataset(TorchDataset):
     def __getitem__(self, idx: int):
         row = self.ds[idx]
 
-        text_anchor = torch.tensor(row[TEXT_ANCHOR_COL], dtype=torch.float32)
+        # Already a tensor thanks to set_format("torch")
+        text_anchor = row[TEXT_ANCHOR_COL].to(torch.float32)
         text_anchor = F.normalize(text_anchor, p=2, dim=-1)
 
         # Positive image layers
         pos_layers = {}
         for col in self.image_layer_cols:
-            pos_layers[col] = torch.tensor(row[col], dtype=torch.float32)
+            pos_layers[col] = row[col].to(torch.float32)
 
-        # Hard-negative image layers
+        # Hard-negative image layers (keeping your exact logic)
         neg_ids = row["negatives"]
-        neg_global_indices = [self.id_to_index[nid] for nid in neg_ids if nid in self.id_to_index]
+        neg_global_indices = [self.id_to_index[nid.item() if isinstance(nid, torch.Tensor) else nid] for nid in neg_ids if nid in self.id_to_index]
         K = len(neg_global_indices)
-
-
-        # neg_layers = {}
-        # if K > 0:
-        #     neg_rows = self.full_ds[neg_global_indices]
-        #     for col in self.image_layer_cols:
-        #         neg_layers[col] = torch.tensor(neg_rows[col], dtype=torch.float32)  # (K, D)
-        # else:
-        #     D = pos_layers[self.image_layer_cols[0]].shape[-1]
-        #     for col in self.image_layer_cols:
-        #         neg_layers[col] = torch.zeros(0, D, dtype=torch.float32)
 
         return text_anchor, pos_layers, neg_global_indices, K
 
@@ -185,6 +160,7 @@ class FastCollate:
         self.image_layer_cols = image_layer_cols
 
     def __call__(self, batch):
+        # Because of set_format("torch"), b[0] and b[1][k] are ALREADY tensors.
         text_anchors = torch.stack([b[0] for b in batch])
         
         # Positives
@@ -203,34 +179,30 @@ class FastCollate:
 
         # BULK FETCH
         if flat_indices:
-            # full_ds[list] is highly optimized in HF Datasets
+            # This now returns a dict of TENSORS, not Python lists!
             neg_data_flat = self.full_ds[flat_indices] 
         else:
-            neg_data_flat = {col: [] for col in self.image_layer_cols}
+            neg_data_flat = None
 
         # Reconstruct tensors
         neg_images = {}
         B = len(batch)
         
-        # Create output tensors (B, K_max, D) initialized to 0
-        # We fill them row by row. 
-        # Note: Ideally we would vectorize the fill, but Python loop here is acceptable 
-        # because we already saved the I/O overhead.
-        
         for col in self.image_layer_cols:
-            # Convert the huge flat list to one big tensor first (CPU)
-            # This is faster than creating tiny tensors
             if flat_indices:
-                flat_tensor = torch.tensor(neg_data_flat[col], dtype=torch.float32)
+                # No more torch.tensor(...) wrapper. Just ensure it's float32.
+                flat_tensor = neg_data_flat[col].to(torch.float32)
             else:
-                flat_tensor = torch.empty(0, pos_images[col].shape[-1])
+                flat_tensor = torch.empty(0, pos_images[col].shape[-1], dtype=torch.float32)
             
+            # Pre-allocate output tensor
             out_tensor = torch.zeros(B, K_max, flat_tensor.shape[-1], dtype=torch.float32)
             
             cursor = 0
             for i, indices in enumerate(neg_indices_per_row):
                 k = len(indices)
                 if k > 0:
+                    # Direct tensor-to-tensor assignment
                     out_tensor[i, :k] = flat_tensor[cursor : cursor+k]
                     cursor += k
             
@@ -419,15 +391,20 @@ def main() -> None:
     image_layer_cols = discover_image_layer_cols(ds_full)
     print(f"  Image layer columns ({len(image_layer_cols)}): {image_layer_cols[0]} .. {image_layer_cols[-1]}")
 
-    # id -> row index for negative lookups
+    # id -> row index for negative lookups (must be done BEFORE set_format)
     all_ids = ds_full["id"]
     id_to_index = {sid: i for i, sid in enumerate(all_ids)}
 
-    # Filter to non-empty query rows for training
+    # Filter to non-empty query rows for training (must be done BEFORE set_format)
     query_mask = [not empty for empty in ds_full["query_is_empty"]]
     query_indices = [i for i, keep in enumerate(query_mask) if keep]
     ds_train = ds_full.select(query_indices)
     print(f"  Training rows (non-empty query): {len(ds_train)}")
+
+    # --- Force PyTorch C-tensor formatting to prevent Python RAM bloat ---
+    cols_to_format = [TEXT_ANCHOR_COL, "negatives"] + image_layer_cols
+    ds_full.set_format(type="torch", columns=cols_to_format)
+    ds_train.set_format(type="torch", columns=cols_to_format)
 
     train_dataset = VDRTrainDataset(
         ds=ds_train,

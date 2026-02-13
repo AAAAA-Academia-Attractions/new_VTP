@@ -560,12 +560,15 @@ def main() -> None:
 
                 # Best-model check on avg NDCG@5
                 avg_ndcg5 = avg_metrics.get("ndcg@5", 0.0) / max(n_langs, 1)
-                if avg_ndcg5 > best_ndcg5[col]:
+                prev_best = best_ndcg5[col]
+                if avg_ndcg5 > prev_best:
                     best_ndcg5[col] = avg_ndcg5
                     best_epoch[col] = epoch
                     ckpt_path = save_dir / f"best_probe_layer_{layer_idx:02d}.pt"
                     torch.save(probes[col].state_dict(), ckpt_path)
-                    print(f"  NEW BEST layer {layer_idx:02d}: ndcg@5={avg_ndcg5:.4f} (epoch {epoch}) -> {ckpt_path}")
+                    print(f"  NEW BEST layer {layer_idx:02d}: ndcg@5={avg_ndcg5:.4f} (prev={prev_best:.4f}, epoch {epoch}) -> {ckpt_path}")
+                else:
+                    print(f"  layer {layer_idx:02d}: ndcg@5={avg_ndcg5:.4f} (best={prev_best:.4f} @ epoch {best_epoch[col]})")
 
                 eval_log[f"eval/best_ndcg5_layer_{layer_idx:02d}"] = best_ndcg5[col]
 

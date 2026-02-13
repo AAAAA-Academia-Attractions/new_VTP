@@ -4,3 +4,4 @@
 /src/download_vdr_dataset.py
 nohup.out
 wandb/
+checkpoints/
