@@ -122,7 +122,22 @@ def layer_index_from_col(col: str) -> int:
 
 
 class VDRTrainDataset(TorchDataset):
-    def __init__(self, ds, id_to_index, image_layer_cols, full_ds):
+    """
+    Wraps the HF Arrow dataset.  Each __getitem__ returns:
+      - text_anchor : (D,) float32   – normalised text_layer_36
+      - image_layers: dict[col_name -> (D,)] float32  – raw image per layer
+      - neg_image_layers: dict[col_name -> (K, D)] float32 – raw neg images per layer
+    """
+
+    def __init__(
+        self,
+        ds: Dataset,
+        id_to_index: Dict[str, int],
+        image_layer_cols: List[str],
+        full_ds: Dataset,
+    ):
+        # ds is the filtered (non-empty query) subset
+        # full_ds is the complete dataset (for negative lookups)
         self.ds = ds
         self.id_to_index = id_to_index
         self.image_layer_cols = image_layer_cols
@@ -134,18 +149,17 @@ class VDRTrainDataset(TorchDataset):
     def __getitem__(self, idx: int):
         row = self.ds[idx]
 
-        # Already a tensor thanks to set_format("torch")
-        text_anchor = row[TEXT_ANCHOR_COL].to(torch.float32)
+        text_anchor = torch.tensor(row[TEXT_ANCHOR_COL], dtype=torch.float32)
         text_anchor = F.normalize(text_anchor, p=2, dim=-1)
 
         # Positive image layers
         pos_layers = {}
         for col in self.image_layer_cols:
-            pos_layers[col] = row[col].to(torch.float32)
+            pos_layers[col] = torch.tensor(row[col], dtype=torch.float32)
 
-        # Hard-negative image layers (keeping your exact logic)
+        # Hard-negative image layers
         neg_ids = row["negatives"]
-        neg_global_indices = [self.id_to_index[nid.item() if isinstance(nid, torch.Tensor) else nid] for nid in neg_ids if nid in self.id_to_index]
+        neg_global_indices = [self.id_to_index[nid] for nid in neg_ids if nid in self.id_to_index]
         K = len(neg_global_indices)
 
         neg_layers = {}
@@ -197,7 +211,7 @@ def collate_fn(batch):
         k = b[3]
         neg_mask[i, :k] = True
 
-        return text_anchors, pos_images, neg_images, neg_mask
+    return text_anchors, pos_images, neg_images, neg_mask
 
 
 # ---------------------------------------------------------------------------
@@ -294,10 +308,6 @@ def evaluate_probes_on_test(
 
     for lang in tqdm(languages, desc="Eval languages"):
         ds = load_from_disk(f"{test_dataset_dir}/{lang}")
-
-        # --- NEW: Force PyTorch formatting on the evaluation dataset ---
-        ds.set_format(type="torch", columns=[TEXT_ANCHOR_COL] + image_layer_cols)
-
         all_ids = ds["id"]
         id_to_idx = {sid: i for i, sid in enumerate(all_ids)}
 
@@ -321,11 +331,8 @@ def evaluate_probes_on_test(
 
         for col in image_layer_cols:
             probe = probes[col]
-            
-            # --- UPDATE: ds[col] is now already a tensor ---
-            # Just move it to the device and ensure it's float32
-            all_image_raw = ds[col].to(device, dtype=torch.float32)
-            
+            # Build probed corpus from ALL rows
+            all_image_raw = torch.tensor(ds[col], dtype=torch.float32, device=device)
             corpus = probe(all_image_raw)  # already normalised by the probe
             n_corpus = corpus.shape[0]
 
@@ -380,15 +387,7 @@ def main() -> None:
     print(f"  Total rows: {len(ds_full)}")
 
     image_layer_cols = discover_image_layer_cols(ds_full)
-
-    # --- NEW: Force PyTorch C-tensor formatting to prevent Python RAM bloat ---
-    cols_to_format = [TEXT_ANCHOR_COL, "negatives"] + image_layer_cols
-    ds_full.set_format(type="torch", columns=cols_to_format)
-
-    print(f"  Total rows: {len(ds_full)}")
     print(f"  Image layer columns ({len(image_layer_cols)}): {image_layer_cols[0]} .. {image_layer_cols[-1]}")
-
-
 
     # id -> row index for negative lookups
     all_ids = ds_full["id"]
@@ -406,7 +405,6 @@ def main() -> None:
         image_layer_cols=image_layer_cols,
         full_ds=ds_full,
     )
-    collate_fn = FastCollate(full_ds=ds_full, image_layer_cols=image_layer_cols)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -461,7 +459,7 @@ def main() -> None:
             text_anchors = text_anchors.to(device)     # (B, D) already normalised
             neg_mask = neg_mask.to(device)              # (B, K)
 
-            total_loss = torch.zeros(1, device=device)
+            total_loss = torch.tensor(0.0, device=device)
             log_dict: Dict[str, float] = {}
 
             for col in image_layer_cols:
