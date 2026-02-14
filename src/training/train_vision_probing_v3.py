@@ -21,7 +21,6 @@ Best checkpoint saved per layer independently based on avg NDCG@5.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 import time
 from pathlib import Path
@@ -45,6 +44,7 @@ _SRC_DIR = _SCRIPT_DIR.parent
 sys.path.insert(0, str(_SRC_DIR))
 
 from model_definition.internal_representation_probing import InternalRepresentationProbing  # noqa: E402
+from transformers.optimization import get_cosine_schedule_with_warmup  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -69,6 +69,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--lambda-l1", type=float, default=1e-4,
                     help="L1 regularisation strength on probe.p")
+    p.add_argument("--warmup-ratio", type=float, default=0.1,
+                    help="Fraction of total steps for linear LR warmup (0-1). Default 0.1.")
     p.add_argument("--seed", type=int, default=42)
     # eval
     p.add_argument("--eval-every-n-epochs", type=int, default=1)
@@ -78,6 +80,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default="auto")
     p.add_argument("--num-workers", type=int, default=1)
     p.add_argument("--save-dir", default="/root/autodl-tmp/new_VTP/checkpoints/vision_probing")
+    p.add_argument("--save-interval", type=int, default=5,
+                    help="Save checkpoint every N epochs. Default 1.")
     p.add_argument("--run-name", default=None)
     # wandb
     p.add_argument("--wandb-entity", default="5a-academia-attractions")
@@ -119,6 +123,66 @@ def discover_image_layer_cols(ds) -> List[str]:
 def layer_index_from_col(col: str) -> int:
     """'image_layer_03' -> 3"""
     return int(col.split("_")[-1])
+
+
+def save_best_checkpoint(
+    save_dir: Path,
+    *,
+    probe_state: dict,
+    optimizer_state: dict,
+    best_val_loss: float,
+    best_ndcg5: float,
+    best_epoch: int,
+    layer_idx: int,
+) -> Path:
+    """
+    Save best checkpoint for one layer in save_dir/layer_XX/.
+    """
+    save_dir = Path(save_dir)
+    layer_dir = save_dir / f"layer_{layer_idx:02d}"
+    layer_dir.mkdir(parents=True, exist_ok=True)
+
+    ckpt = {
+        "probe": probe_state,
+        "optimizer": optimizer_state,
+        "best_val_loss": best_val_loss,
+        "best_ndcg5": best_ndcg5,
+        "best_epoch": best_epoch,
+    }
+    path = layer_dir / "best_vision_probe.pt"
+    torch.save(ckpt, path)
+    return path
+
+
+def save_interval_checkpoint(
+    save_dir: Path,
+    *,
+    probes: Dict[str, nn.Module],
+    optimizer_state: dict,
+    epoch: int,
+    global_step: int,
+    epoch_avg_loss: Dict[str, float],
+    last_step_loss: Dict[str, float],
+    image_layer_cols: List[str],
+) -> None:
+    """
+    Save interval checkpoint per layer in save_dir/layer_XX/.
+    Each layer file: probe, optimizer, epoch, global_step, epoch_avg_loss, last_step_loss.
+    """
+    save_dir = Path(save_dir)
+    for col in image_layer_cols:
+        layer_idx = int(col.split("_")[-1])
+        layer_dir = save_dir / f"layer_{layer_idx:02d}"
+        layer_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = {
+            "probe": probes[col].state_dict(),
+            "optimizer": optimizer_state,
+            "epoch": epoch,
+            "global_step": global_step,
+            "epoch_avg_loss": epoch_avg_loss[col],
+            "last_step_loss": last_step_loss[col],
+        }
+        torch.save(ckpt, layer_dir / f"checkpoint_epoch_{epoch}.pt")
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +352,87 @@ def compute_metrics_from_topk(
 
 
 @torch.no_grad()
+def compute_validation_loss(
+    probes: Dict[str, InternalRepresentationProbing],
+    val_dataset_dir: str,
+    image_layer_cols: List[str],
+    languages: Sequence[str],
+    device: str,
+    val_batch_size: int = 256,
+) -> Tuple[float, Dict[str, float]]:
+    """
+    Compute InfoNCE validation loss using in-batch negatives (batch_size samples per batch).
+    Returns (total_avg_loss, {layer_col: loss}).
+    """
+    for probe in probes.values():
+        probe.eval()
+
+    total_loss_sum = 0.0
+    total_steps = 0
+    loss_per_layer: Dict[str, float] = {col: 0.0 for col in image_layer_cols}
+    steps_per_layer: Dict[str, int] = {col: 0 for col in image_layer_cols}
+
+    for lang in tqdm(languages, desc="Val loss"):
+        ds = load_from_disk(f"{val_dataset_dir}/{lang}")
+        query_mask = [not empty for empty in ds["query_is_empty"]]
+        query_indices = [i for i, keep in enumerate(query_mask) if keep]
+        ds_val = ds.select(query_indices)
+        n_val = len(ds_val)
+        if n_val == 0:
+            continue
+
+        for start in range(0, n_val, val_batch_size):
+            end = min(start + val_batch_size, n_val)
+            B = end - start
+            if B < 2:
+                continue
+
+            text_anchors = torch.tensor(
+                ds_val[TEXT_ANCHOR_COL][start:end], dtype=torch.float32, device=device
+            )
+            text_anchors = F.normalize(text_anchors, p=2, dim=-1)
+
+            batch_loss = 0.0
+            for col in image_layer_cols:
+                pos_raw = torch.tensor(
+                    ds_val[col][start:end], dtype=torch.float32, device=device
+                )
+                probed_pos = probes[col](pos_raw)
+
+                neg_list = []
+                for i in range(B):
+                    neg_indices = [j for j in range(B) if j != i]
+                    neg_list.append(probed_pos[neg_indices])
+                probed_neg = torch.stack(neg_list, dim=0)
+                neg_mask = torch.ones(B, B - 1, dtype=torch.bool, device=device)
+
+                logit_scale = probes[col].get_logit_scale()
+                loss_layer, _ = infonce_loss_one_layer(
+                    text_query=text_anchors,
+                    probed_pos=probed_pos,
+                    probed_neg=probed_neg,
+                    neg_mask=neg_mask,
+                    logit_scale=logit_scale,
+                )
+                batch_loss = batch_loss + loss_layer.item()
+                loss_per_layer[col] += loss_layer.item()
+                steps_per_layer[col] += 1
+
+            total_loss_sum += batch_loss
+            total_steps += 1
+
+    for probe in probes.values():
+        probe.train()
+
+    n_layers = len(image_layer_cols)
+    total_avg = total_loss_sum / max(total_steps * n_layers, 1)
+    for col in image_layer_cols:
+        loss_per_layer[col] = loss_per_layer[col] / max(steps_per_layer[col], 1)
+
+    return total_avg, loss_per_layer
+
+
+@torch.no_grad()
 def evaluate_probes_on_test(
     probes: Dict[str, InternalRepresentationProbing],
     test_dataset_dir: str,
@@ -437,26 +582,43 @@ def main() -> None:
         all_params.extend(probe.parameters())
     optimizer = torch.optim.Adam(all_params, lr=args.lr)
 
+    # LR schedule: warmup + cosine decay
+    num_training_steps = args.epochs * len(train_loader)
+    num_warmup_steps = int(args.warmup_ratio * num_training_steps)
+
+    # ------------------------------------------------------------------
+    # Best-model tracking (save when BOTH val_loss and ndcg@5 improve)
+    # ------------------------------------------------------------------
+    best_val_loss: Dict[str, float] = {col: float("inf") for col in image_layer_cols}
+    best_ndcg5: Dict[str, float] = {col: 0.0 for col in image_layer_cols}
+    best_epoch: Dict[str, int] = {col: -1 for col in image_layer_cols}
+
+    start_epoch = 1
+    global_step = 0
+
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        last_epoch=global_step - 1,
+    )
+
     print(f"\nDevice: {device}")
     print(f"Probes: {len(probes)}  |  params per probe: p({D},) + logit_scale(1,)")
     print(f"Epochs: {args.epochs}  |  batch_size: {args.batch_size}  |  lr: {args.lr}")
     print(f"L1 lambda: {args.lambda_l1}")
+    print(f"LR schedule: warmup {num_warmup_steps} steps ({args.warmup_ratio:.0%}) + cosine decay to 0")
     print(f"Eval every {args.eval_every_n_epochs} epoch(s) on languages: {eval_languages}")
-
-    # ------------------------------------------------------------------
-    # Best-model tracking
-    # ------------------------------------------------------------------
-    best_ndcg5: Dict[str, float] = {col: 0.0 for col in image_layer_cols}
-    best_epoch: Dict[str, int] = {col: -1 for col in image_layer_cols}
 
     # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    global_step = 0
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t_epoch = time.time()
         epoch_loss = 0.0
         epoch_steps = 0
+        epoch_loss_per_layer: Dict[str, float] = {col: 0.0 for col in image_layer_cols}
+        last_step_loss_per_layer: Dict[str, float] = {col: 0.0 for col in image_layer_cols}
 
         for probe in probes.values():
             probe.train()
@@ -498,6 +660,8 @@ def main() -> None:
 
                 layer_total = loss_layer + l1_reg
                 total_loss = total_loss + layer_total
+                epoch_loss_per_layer[col] += layer_total.item()
+                last_step_loss_per_layer[col] = layer_total.item()
 
                 layer_idx = layer_index_from_col(col)
                 log_dict[f"train/loss_layer_{layer_idx:02d}"] = loss_layer.item()
@@ -508,8 +672,10 @@ def main() -> None:
             optimizer.zero_grad()
             total_loss.backward()
             optimizer.step()
+            scheduler.step()
 
             log_dict["train/total_loss"] = total_loss.item()
+            log_dict["train/lr"] = scheduler.get_last_lr()[0]
             log_dict["train/epoch"] = epoch
             wandb.log(log_dict, step=global_step)
 
@@ -520,19 +686,21 @@ def main() -> None:
             pbar.set_postfix(loss=f"{total_loss.item():.4f}")
 
         avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+        epoch_avg_loss_per_layer = {
+            col: epoch_loss_per_layer[col] / max(epoch_steps, 1) for col in image_layer_cols
+        }
         elapsed = time.time() - t_epoch
         print(f"Epoch {epoch} done — avg_loss={avg_epoch_loss:.4f}  time={elapsed:.1f}s")
 
         # --------------------------------------------------------------
-        # Log |p| mean absolute value per probe
+        # Log probe vector (p) per layer
         # --------------------------------------------------------------
         p_log: Dict[str, float] = {}
-        print("\n  Probe |p| mean absolute values:")
         for col in image_layer_cols:
             layer_idx = layer_index_from_col(col)
-            p_abs_mean = probes[col].p.abs().mean().item()
-            p_log[f"probe/p_abs_mean_layer_{layer_idx:02d}"] = p_abs_mean
-            print(f"    layer {layer_idx:02d}: |p|_mean = {p_abs_mean:.6f}")
+            p = probes[col].p.detach()
+            p_log[f"probe/p_abs_mean_layer_{layer_idx:02d}"] = p.abs().mean().item()
+            p_log[f"probe/p_distribution_layer_{layer_idx:02d}"] = wandb.Histogram(p.cpu().numpy())
         wandb.log(p_log, step=global_step)
 
         # --------------------------------------------------------------
@@ -541,6 +709,17 @@ def main() -> None:
         if epoch % args.eval_every_n_epochs == 0:
             print(f"\n--- Evaluation after epoch {epoch} ---")
             t_eval = time.time()
+
+            # Validation loss (used for best-model selection)
+            val_loss_avg, val_loss_per_layer = compute_validation_loss(
+                probes=probes,
+                val_dataset_dir=args.test_dataset_dir,
+                image_layer_cols=image_layer_cols,
+                languages=eval_languages,
+                device=device,
+                val_batch_size=args.batch_size,
+            )
+
             eval_results = evaluate_probes_on_test(
                 probes=probes,
                 test_dataset_dir=args.test_dataset_dir,
@@ -550,44 +729,74 @@ def main() -> None:
                 device=device,
             )
 
-            eval_log: Dict[str, float] = {}
+            optimizer_state = optimizer.state_dict()
+            eval_log: Dict[str, float] = {
+                "eval/val_loss_avg": val_loss_avg,
+            }
             for col in image_layer_cols:
                 layer_idx = layer_index_from_col(col)
+                eval_log[f"eval/val_loss_layer_{layer_idx:02d}"] = val_loss_per_layer[col]
+
                 avg_metrics: Dict[str, float] = {}
                 for lang, metrics in eval_results[col].items():
                     for mk, val in metrics.items():
-                        key = f"eval/{lang}/{mk}_layer_{layer_idx:02d}"
-                        eval_log[key] = val
                         avg_metrics[mk] = avg_metrics.get(mk, 0.0) + val
 
                 n_langs = len(eval_results[col])
                 for mk in avg_metrics:
                     avg_val = avg_metrics[mk] / n_langs
-                    eval_log[f"eval/avg/{mk}_layer_{layer_idx:02d}"] = avg_val
+                    eval_log[f"eval/{mk}_layer_{layer_idx:02d}"] = avg_val
 
-                # Best-model check on avg NDCG@5
                 avg_ndcg5 = avg_metrics.get("ndcg@5", 0.0) / max(n_langs, 1)
-                if avg_ndcg5 > best_ndcg5[col]:
+                val_improved = val_loss_per_layer[col] < best_val_loss[col]
+                ndcg_improved = avg_ndcg5 > best_ndcg5[col]
+
+                # Best-model check: save iff BOTH val_loss and ndcg@5 improve
+                if val_improved and ndcg_improved:
+                    best_val_loss[col] = val_loss_per_layer[col]
                     best_ndcg5[col] = avg_ndcg5
                     best_epoch[col] = epoch
-                    ckpt_path = save_dir / f"best_probe_layer_{layer_idx:02d}.pt"
-                    torch.save(probes[col].state_dict(), ckpt_path)
-                    print(f"  NEW BEST layer {layer_idx:02d}: ndcg@5={avg_ndcg5:.4f} (epoch {epoch}) -> {ckpt_path}")
+                    ckpt_path = save_best_checkpoint(
+                        save_dir,
+                        probe_state=probes[col].state_dict(),
+                        optimizer_state=optimizer_state,
+                        best_val_loss=val_loss_per_layer[col],
+                        best_ndcg5=avg_ndcg5,
+                        best_epoch=epoch,
+                        layer_idx=layer_idx,
+                    )
+                    print(f"  NEW BEST layer {layer_idx:02d}: val_loss={val_loss_per_layer[col]:.4f} ndcg@5={avg_ndcg5:.4f} (epoch {epoch}) -> {ckpt_path}")
 
+                eval_log[f"eval/best_val_loss_layer_{layer_idx:02d}"] = best_val_loss[col]
                 eval_log[f"eval/best_ndcg5_layer_{layer_idx:02d}"] = best_ndcg5[col]
 
             wandb.log(eval_log, step=global_step)
-            print(f"  Eval took {time.time() - t_eval:.1f}s\n")
+            print(f"  Val loss: {val_loss_avg:.4f}  |  Eval took {time.time() - t_eval:.1f}s\n")
+
+        # --------------------------------------------------------------
+        # Save interval checkpoint (no val/ndcg/best_epoch)
+        # --------------------------------------------------------------
+        if epoch % args.save_interval == 0:
+            save_interval_checkpoint(
+                save_dir,
+                probes=probes,
+                optimizer_state=optimizer.state_dict(),
+                epoch=epoch,
+                global_step=global_step,
+                epoch_avg_loss=epoch_avg_loss_per_layer,
+                last_step_loss=last_step_loss_per_layer,
+                image_layer_cols=image_layer_cols,
+            )
 
     # ------------------------------------------------------------------
     # Final summary
     # ------------------------------------------------------------------
     print("\n" + "=" * 70)
-    print("TRAINING COMPLETE — Best NDCG@5 per layer")
+    print("TRAINING COMPLETE — Best (val_loss, ndcg@5) per layer")
     print("=" * 70)
     for col in image_layer_cols:
         layer_idx = layer_index_from_col(col)
-        print(f"  layer {layer_idx:02d}: ndcg@5={best_ndcg5[col]:.4f}  (epoch {best_epoch[col]})")
+        print(f"  layer {layer_idx:02d}: val_loss={best_val_loss[col]:.4f} ndcg@5={best_ndcg5[col]:.4f}  (epoch {best_epoch[col]})")
     print("=" * 70)
 
     wandb.finish()
